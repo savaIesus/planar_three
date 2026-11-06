@@ -1,0 +1,9 @@
+{
+    "width_image_container": 600,
+    "height_image_container": 600,
+    "distance_between_horizontal_centers": 18.7,
+    "distance_between_vertical_centers": 19.2,
+    "number_of_rows": 10,
+    "number_of_columns": 10,
+    "theme": "light"
+}

@@ -1,0 +1,58 @@
+{
+    "middle": {
+        "1": {
+            "name": "Стекло на дне",
+            "path": "project\\station\\weights\\bottom_glass.pt",
+            "color": [
+                0,
+                255,
+                0
+            ],
+            "description": "Определение стекла на обратной части изделия"
+        },
+        "2": {
+            "name": "1",
+            "description": "12",
+            "color": [
+                255,
+                33,
+                3
+            ],
+            "path": "1123"
+        },
+        "3": {
+            "name": "12312",
+            "description": "12",
+            "color": [
+                225,
+                124,
+                3
+            ],
+            "path": "D:\\Downloads\\licensevalidation.txt"
+        }
+    },
+    "near": {
+        "1": {
+            "name": "тест",
+            "path": "project\\station\\weights\\side_flatness_long.pt",
+            "color": [
+                255,
+                0,
+                0
+            ],
+            "description": "Тестовое определение нейросетью"
+        }
+    },
+    "far": {
+        "1": {
+            "name": "тест",
+            "path": "project\\station\\weights\\side_flatness_long.pt",
+            "color": [
+                255,
+                0,
+                0
+            ],
+            "description": "Тестовое определение нейросетью"
+        }
+    }
+}

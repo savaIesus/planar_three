@@ -1,0 +1,13 @@
+{
+    "moved_to_home": 0,
+    "moved_to_cell": 0,
+    "right_view_waiting": 0,
+    "paused": 0,
+    "stopped": 0,
+    "skip_cell": 0,
+    "moving_to_certain": 0,
+    "change_capture": -1,
+    "start_showing": 0,
+    "update_frame": 0,
+    "calibrate_status": 0
+}

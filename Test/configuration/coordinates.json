@@ -1,0 +1,9 @@
+{
+    "x_coordinate_of_the_first_cell": 5.4,
+    "y_coordinate_of_the_first_cell": 220.2,
+    "z_coordinate_of_the_first_cell": 3,
+    "current_coordinate_of_the_station_by_x": 5.4,
+    "current_coordinate_of_the_station_by_y": 220.2,
+    "current_coordinate_of_the_station_by_z": 3,
+    "movement_step": 0.1
+}
