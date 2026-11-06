@@ -1,4 +1,10 @@
-"""Отдельный FastAPI-мастер ручной разметки кадров."""
+"""Отдельный FastAPI-мастер ручной разметки кадров.
+
+Эндпоинты повторяют логику производства: сессия → ячейка паллеты (станция
+встаёт на координаты по маршруту «змейкой») → три камеры → ручная разметка →
+экспорт YOLO. Никакого управления конвейером здесь нет: в этом проекте
+корпуса стоят на паллете, а движение выполняет планарная станция.
+"""
 
 from __future__ import annotations
 
@@ -10,13 +16,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from training.collector import (
+from project.training.collector import (
     CollectorError,
     TrainingCollector,
     TrainingConfig,
     ValidationError,
 )
-from training.yolo import export_yolo_dataset
+from project.training.pallet import PalletError
+from project.training.yolo import export_yolo_dataset
 
 _UI_FOLDER = Path(__file__).parent / "ui"
 
@@ -25,31 +32,34 @@ def create_app(
     collector: TrainingCollector | None = None,
     *,
     frame_source=None,
+    station=None,
     config: TrainingConfig | None = None,
-    conveyor=None,
 ) -> FastAPI:
     """Создать независимое приложение мастера обучения.
 
-    Для production-запуска передайте ``CameraManager``-адаптер через
-    ``frame_source``, а шаг ленты — через ``conveyor``. В тестах удобно
-    передать уже созданный ``TrainingCollector`` с фейковым источником
-    кадров.
+    Для production-запуска передайте источник кадров (``ProjectCameraSource``)
+    через ``frame_source``, а управление станцией — через ``station``
+    (``PlanarStation``). В тестах удобно передать уже созданный
+    ``TrainingCollector`` с фейковыми зависимостями.
     """
     if collector is None:
         collector = TrainingCollector(
             config or TrainingConfig(),
             frame_source=frame_source,
-            conveyor=conveyor,
+            station=station,
         )
     else:
         if frame_source is not None:
             collector.frame_source = frame_source
-        if conveyor is not None:
-            collector.conveyor = conveyor
+        if station is not None:
+            collector.station = station
 
     app = FastAPI(
         title="Мастер сбора датасета YOLO",
-        description="Последовательная съёмка камер и ручная разметка дефектов",
+        description=(
+            "Съёмка корпусов на паллете тремя камерами станции и ручная "
+            "разметка дефектов"
+        ),
     )
     app.state.training_collector = collector
 
@@ -73,17 +83,79 @@ def create_app(
     @app.get("/api/training/config")
     async def get_config():
         item = current_collector()
+        station = item.station
+        source = item.frame_source
+        cameras = (
+            source.status()
+            if source is not None and hasattr(source, "status")
+            else {"opened": False, "mapping": {}}
+        )
         return JSONResponse(
             {
                 "camera_roles": list(item.config.camera_roles),
+                "cameras": cameras,
+                "camera_mapping": dict(cameras.get("mapping") or {}),
                 "defect_classes": list(item.config.defect_classes),
                 "yolo_task": item.config.yolo_task,
                 "root_folder": str(item.config.root_folder),
-                "conveyor_step": item.conveyor is not None,
+                "stations": (
+                    {
+                        **station.status(),
+                        "following": item.moves_enabled,
+                    }
+                    if station is not None and hasattr(station, "status")
+                    else {"enabled": False, "connected": False, "following": False}
+                ),
+                "motion_enabled": item.moves_enabled,
+                "pallet": item.pallet_payload(),
+                "start_cell": item.config.start_cell,
             }
         )
 
-    @app.post("/api/training/session")
+    @app.get("/api/training/cells")
+    async def get_cells():
+        item = current_collector()
+        return JSONResponse(
+            {
+                "pallet": item.pallet_payload(),
+                "cells": item.cells(),
+                "station": (
+                    item.station.status()
+                    if item.station is not None and hasattr(item.station, "status")
+                    else {"enabled": False, "connected": False}
+                ),
+            }
+        )
+
+    @app.post("/api/training/cells/move")
+    async def move_to_cell(payload: dict[str, Any] | None = None):
+        payload = payload or {}
+        item = current_collector()
+        cell_id = payload.get("cell_id")
+        if cell_id is None:
+            return _error_response(ValidationError("Не указан cell_id"), 400)
+        try:
+            await asyncio.to_thread(item.move_to_cell, int(cell_id))
+        except ValidationError as exc:
+            return _error_response(exc, 400)
+        except (CollectorError, PalletError) as exc:
+            return _error_response(exc, 409)
+        except Exception as exc:
+            return _error_response(exc, 500)
+        return JSONResponse(_state_with_urls(item))
+
+    @app.post("/api/training/home")
+    async def station_home():
+        item = current_collector()
+        try:
+            await asyncio.to_thread(item.home)
+        except CollectorError as exc:
+            return _error_response(exc, 409)
+        except Exception as exc:
+            return _error_response(exc, 500)
+        return JSONResponse(_state_with_urls(item))
+
+    @app.post("/api/training/session", response_model=None)
     async def start_session(payload: dict[str, Any] | None = None):
         payload = payload or {}
         item = current_collector()
@@ -97,10 +169,16 @@ def create_app(
                 camera_roles=_list_value(
                     payload.get("camera_roles"), item.config.camera_roles
                 ),
+                start_cell=(
+                    int(payload["start_cell"])
+                    if payload.get("start_cell") is not None
+                    else None
+                ),
+                follow_pallet=payload.get("follow_pallet"),
             )
         except ValidationError as exc:
             return _error_response(exc, 400)
-        except CollectorError as exc:
+        except (CollectorError, PalletError) as exc:
             return _error_response(exc, 409)
         return JSONResponse(_state_with_urls(item))
 
@@ -129,17 +207,32 @@ def create_app(
     async def start_part(payload: dict[str, Any] | None = None):
         payload = payload or {}
         item = current_collector()
+        cell_id = payload.get("cell_id")
         try:
-            await asyncio.to_thread(item.begin_part, _optional_text(payload.get("label")))
-        except CollectorError as exc:
+            await asyncio.to_thread(
+                item.begin_part,
+                _optional_text(payload.get("label")),
+                cell_id=int(cell_id) if cell_id is not None else None,
+            )
+        except ValidationError as exc:
+            return _error_response(exc, 400)
+        except (CollectorError, PalletError) as exc:
             return _error_response(exc, 409)
+        except Exception as exc:
+            return _error_response(exc, 500)
         return JSONResponse(_state_with_urls(item))
 
     @app.post("/api/training/capture")
-    async def capture_next():
+    async def capture_next(payload: dict[str, Any] | None = None):
+        payload = payload or {}
         item = current_collector()
         try:
-            record = await asyncio.to_thread(item.capture_next)
+            record = await asyncio.to_thread(
+                item.capture_next,
+                camera_role=_optional_text(payload.get("camera_role")),
+            )
+        except ValidationError as exc:
+            return _error_response(exc, 400)
         except CollectorError as exc:
             return _error_response(exc, 409)
         except Exception as exc:
@@ -238,22 +331,15 @@ def create_app(
             return _error_response(exc, 500)
         return JSONResponse(_json_safe(result))
 
-    @app.post("/api/training/conveyor/step")
-    async def step_conveyor():
-        item = current_collector()
-        try:
-            result = await asyncio.to_thread(item.step_conveyor)
-        except CollectorError as exc:
-            return _error_response(exc, 409)
-        except Exception as exc:
-            return _error_response(exc, 500)
-        return JSONResponse(_json_safe(result))
-
     @app.post("/api/training/session/finish")
-    async def finish_session():
+    async def finish_session(payload: dict[str, Any] | None = None):
+        payload = payload or {}
         item = current_collector()
         try:
-            result = await asyncio.to_thread(item.finish_session)
+            result = await asyncio.to_thread(
+                item.finish_session,
+                go_home=bool(payload.get("go_home")),
+            )
         except CollectorError as exc:
             return _error_response(exc, 409)
         except Exception as exc:

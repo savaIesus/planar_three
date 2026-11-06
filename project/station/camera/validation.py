@@ -1,5 +1,4 @@
 import cv2
-from torch import ExecutionPlan
 
 
 def get_available_camera_indices():

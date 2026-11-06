@@ -26,28 +26,38 @@ def detect_port():
         return None
 
 
-def define_presets():
+def define_presets(port=None, baudrate=115200, timeout=1):
     """
     Определяет настройки подключения: порт, скорость передачи данных, таймаут.
-    Возвращает список с настройками.
+    Если порт не задан явно, он ищется автоматически.
+
+    :param port: имя COM-порта или None для автопоиска
+    :param baudrate: скорость обмена
+    :param timeout: таймаут чтения, с
+    :return: список [порт, скорость, таймаут]
     """
-    port = detect_port()
+    if port is None:
+        port = detect_port()
     if port is None:
         raise ValueError("Не удалось найти подходящий COM-порт.")
-
-    baudrate = 115200
-    timeout = 1
 
     return [port, baudrate, timeout]
 
 
-def establish_connection(app_page):
+def establish_connection(app_page=None, port=None, baudrate=115200, timeout=1):
     """
     Устанавливает подключение через Serial.
     Возвращает объект подключения или None, если подключение не удалось.
+
+    :param app_page: страница Flet для показа диалога ошибки; может быть None,
+                     если вызывающий код не связан с интерфейсом
+                     (например, мастер сбора датасета)
+    :param port: имя COM-порта; None — автопоиск по описанию 'USB-SERIAL'
+    :param baudrate: скорость обмена
+    :param timeout: таймаут чтения, с
     """
     try:
-        port, baudrate, timeout = define_presets()
+        port, baudrate, timeout = define_presets(port, baudrate, timeout)
         connection = serial.Serial(port, baudrate, timeout=timeout)
 
         # Очищаем входной и выходной буферы
@@ -67,7 +77,8 @@ def establish_connection(app_page):
 
     except ValueError as e:
         print(f"Ошибка конфигурации: {e}")
-        show_error("Ошибка конфигурации!", e, app_page)
+        if app_page is not None:
+            show_error("Ошибка конфигурации!", e, app_page)
         return None
 
 

@@ -3,8 +3,15 @@
 Здесь нет привязки к FastAPI или к конкретному UI. Коллектор получает кадр
 через небольшой протокол ``CameraFrameSource``, сразу сохраняет неизменённый
 оригинал, а после решения оператора создаёт отдельную картинку с разметкой и
-YOLO label-файл. Это позволяет использовать тот же класс в HMI, в отдельном
-веб-мастере и в автоматических тестах.
+YOLO label-файл.
+
+Ключевое отличие от конвейерного варианта: «деталь» в этом проекте — это
+ячейка паллеты (один корпус под тремя камерами), а не шаг ленты. Перед
+съёмкой станция :class:`training.station.PlanarStation` встаёт на координаты
+ячейки по тому же маршруту «змейкой», по которому её водит
+:func:`project.alghorithms.core.main_algorithm`, и только затем камеры делают
+снимки. Поэтому учебный кадр всегда связан с реальным номером корпуса на
+паллете и с его координатами.
 """
 
 from __future__ import annotations
@@ -22,33 +29,35 @@ from typing import Any, Protocol, Sequence, runtime_checkable
 import cv2
 import numpy as np
 
-from training.yolo import (
+from project.training.pallet import (
+    Cell,
+    PalletError,
+    PalletOrigin,
+    PalletSettings,
+    build_route,
+)
+from project.training.paths import COORDINATES_FILE, LAUNCH_FILE, default_dataset_root
+from project.training.yolo import (
     PolygonAnnotation,
-    annotation_to_yolo_lines,
     draw_annotations,
+    annotation_to_yolo_lines,
     normalise_polygon,
 )
 
+# Порядок ролей совпадает с порядком камер production-приложения:
+# индекс 0 — near, 1 — far, 2 — middle (см. project/alghorithms/contour.py).
+DEFAULT_CAMERA_ROLES = ("near", "far", "middle")
 
-DEFAULT_CAMERA_ROLES = (
-    "INPUT_LEFT",
-    "INPUT_RIGHT",
-    "SPIDER_LEFT",
-    "SPIDER_RIGHT",
-    "SPIDER_IN",
-    "SPIDER_OUT",
-    "TOP",
-)
-
-# Список можно переопределить через форму мастера. Названия намеренно
-# нейтральные: конкретный набор моделей может иметь собственную таксономию.
+# Типы брака, которые уже понимает протокол производства
+# (project/alghorithms/protocols.py: defect_type_mapping).
 DEFAULT_DEFECT_CLASSES = (
+    "omission",
+    "sinks",
+    "platform",
+    "contacts",
+    "flatness",
     "glass",
-    "black_spot",
-    "window_sink",
-    "long_omission",
-    "short_omission",
-    "missing_contact",
+    "mechanics",
     "other",
 )
 
@@ -65,19 +74,14 @@ class ValidationError(CollectorError, ValueError):
 
 @runtime_checkable
 class CameraFrameSource(Protocol):
-    """Минимальный интерфейс источника кадров.
-
-    ``CameraManager`` из production-приложения уже реализует этот API через
-    ``capture_single(role)``. Протокол позволяет не импортировать и не
-    запускать производственный цикл внутри мастера обучения.
-    """
+    """Минимальный интерфейс источника кадров."""
 
     def capture_single(self, role: str) -> Any:
         """Вернуть свежий BGR-кадр выбранной роли."""
 
 
 class CollectorCameraSource:
-    """Адаптер для явного описания зависимости от CameraManager."""
+    """Адаптер для явного описания зависимости от источника камер."""
 
     def __init__(self, cameras: CameraFrameSource):
         if not hasattr(cameras, "capture_single"):
@@ -92,12 +96,16 @@ class CollectorCameraSource:
 class TrainingConfig:
     """Настройки одной партии учебных изображений."""
 
-    root_folder: str | os.PathLike[str] = "training_datasets"
+    root_folder: str | os.PathLike[str] = str(default_dataset_root())
     camera_roles: tuple[str, ...] = DEFAULT_CAMERA_ROLES
     defect_classes: tuple[str, ...] = DEFAULT_DEFECT_CLASSES
     jpeg_quality: int = 98
     validation_ratio: float = 0.2
     yolo_task: str = "segment"
+    # Обход паллеты: номер первой ячейки (1..rows*columns) и признак того,
+    # что мастер ведёт станцию по ячейкам сам.
+    start_cell: int = 1
+    follow_pallet: bool = True
 
     def __post_init__(self) -> None:
         root = str(self.root_folder).strip()
@@ -114,12 +122,17 @@ class TrainingConfig:
         task = str(self.yolo_task or "segment").strip().lower()
         if task not in ("segment", "detect"):
             raise ValidationError("yolo_task должен быть segment или detect")
+        start_cell = int(self.start_cell)
+        if start_cell < 1:
+            raise ValidationError("Номер первой ячейки начинается с 1")
         object.__setattr__(self, "root_folder", root)
         object.__setattr__(self, "camera_roles", roles)
         object.__setattr__(self, "defect_classes", classes)
         object.__setattr__(self, "jpeg_quality", quality)
         object.__setattr__(self, "validation_ratio", ratio)
         object.__setattr__(self, "yolo_task", task)
+        object.__setattr__(self, "start_cell", start_cell)
+        object.__setattr__(self, "follow_pallet", bool(self.follow_pallet))
 
 
 @dataclass(frozen=True)
@@ -201,6 +214,9 @@ class FrameRecord:
     annotations: list[Any] = field(default_factory=list)
     captured_at: str = ""
     annotated_at: str | None = None
+    cell_id: int | None = None
+    row: int | None = None
+    column: int | None = None
 
     @property
     def has_defect(self) -> bool:
@@ -211,6 +227,9 @@ class FrameRecord:
             "image_id": self.image_id,
             "frame_uid": self.frame_uid,
             "part_id": self.part_id,
+            "cell_id": self.cell_id,
+            "row": self.row,
+            "column": self.column,
             "camera_role": self.camera_role,
             # role — короткий алиас для внешних интеграций.
             "role": self.camera_role,
@@ -242,7 +261,7 @@ class TrainingDatasetStore:
     ``yolo/`` после завершения содержит готовую структуру train/val.
     """
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -305,7 +324,13 @@ class TrainingDatasetStore:
     def part_count(self) -> int:
         return len(self._parts)
 
-    def create_part(self, label: str | None = None) -> dict[str, Any]:
+    def create_part(
+        self,
+        label: str | None = None,
+        *,
+        cell: Cell | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
             part_id = self._next_part_id
             self._next_part_id += 1
@@ -318,10 +343,19 @@ class TrainingDatasetStore:
                 ),
                 "finished_at": None,
                 "frame_ids": [],
+                "cell_id": cell.cell_id if cell else None,
+                "row": cell.row if cell else None,
+                "column": cell.column if cell else None,
+                "coordinates": (
+                    {"x": round(cell.x, 3), "y": round(cell.y, 3), "z": round(cell.z, 3)}
+                    if cell
+                    else None
+                ),
+                "movement": dict(metadata or {}),
             }
             self._parts[part_id] = part
             self._write_state()
-            return dict(part)
+            return _copy_part(part)
 
     def finish_part(self, part_id: int) -> dict[str, Any]:
         with self._lock:
@@ -340,7 +374,16 @@ class TrainingDatasetStore:
                 timespec="seconds"
             )
             self._write_state()
-            return dict(part)
+            return _copy_part(part)
+
+    def set_part_movement(self, part_id: int, movement: dict[str, Any]) -> None:
+        """Дописать в деталь сведения о позиционировании станции."""
+        with self._lock:
+            part = self._parts.get(int(part_id))
+            if part is None:
+                return
+            part["movement"] = dict(movement)
+            self._write_state()
 
     def create_frame(
         self,
@@ -388,6 +431,9 @@ class TrainingDatasetStore:
                     self.session_folder,
                 ),
                 captured_at=captured_at,
+                cell_id=part.get("cell_id"),
+                row=part.get("row"),
+                column=part.get("column"),
             )
             self._frames[image_id] = record
             part["frame_ids"].append(image_id)
@@ -494,7 +540,23 @@ class TrainingDatasetStore:
 
     def get_parts(self) -> list[dict[str, Any]]:
         with self._lock:
-            return [dict(item) for item in self._parts.values()]
+            return [_copy_part(item) for item in self._parts.values()]
+
+    def get_part(self, part_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            part = self._parts.get(int(part_id))
+            return _copy_part(part) if part else None
+
+    def part_frames(self, part_id: int) -> list[FrameRecord]:
+        with self._lock:
+            part = self._parts.get(int(part_id))
+            if part is None:
+                return []
+            return [
+                _copy_record(self._frames[frame_id])
+                for frame_id in part["frame_ids"]
+                if frame_id in self._frames
+            ]
 
     def image_path(self, image_id: int, kind: str = "original") -> Path:
         record = self._frames.get(int(image_id))
@@ -560,7 +622,7 @@ class TrainingDatasetStore:
                 "yolo_task": self.config.yolo_task,
                 "frame_count": len(self._frames),
                 "part_count": len(self._parts),
-                "parts": [dict(item) for item in self._parts.values()],
+                "parts": [_copy_part(item) for item in self._parts.values()],
             }
 
     def _write_classes(self) -> None:
@@ -588,36 +650,144 @@ class TrainingDatasetStore:
             self.session_folder / "session.json",
             {
                 **self.state_payload(),
-                "parts": [dict(item) for item in self._parts.values()],
+                "parts": [_copy_part(item) for item in self._parts.values()],
             },
         )
 
 
 class TrainingCollector:
-    """Последовательный мастер: деталь → камеры → разметка → YOLO."""
+    """Мастер сбора: ячейка паллеты → камеры → разметка → YOLO."""
 
     def __init__(
         self,
         config: TrainingConfig | None = None,
         *,
         frame_source: CameraFrameSource | None = None,
-        conveyor: Any | None = None,
+        station: Any | None = None,
+        pallet: PalletSettings | None = None,
+        origin: PalletOrigin | None = None,
+        launch_file: str | os.PathLike[str] = LAUNCH_FILE,
+        coordinates_file: str | os.PathLike[str] = COORDINATES_FILE,
     ):
         self.config = config or TrainingConfig()
         self.frame_source = frame_source
-        # Объект с методом ``advance()``: шаг ленты к следующей детали после
-        # нажатия «Завершить деталь». ``None`` отключает движение, чтобы
-        # мастер можно было использовать без подключённого контроллера.
-        self.conveyor = conveyor
-        self.last_conveyor_result: dict[str, Any] | None = None
+        # Объект с методами ``move_to_cell(cell)``/``home()``: планарная
+        # станция проекта. ``None`` — мастер не двигает станцию (разметка
+        # кадров без оборудования или съёмка с текущей позиции).
+        self.station = station
+        # Ручной «шаг» по паллете: двигать станцию на произвольную ячейку.
         self.store: TrainingDatasetStore | None = None
         self.current_part_id: int | None = None
         self.current_frame_id: int | None = None
+        self._launch_file = launch_file
+        self._coordinates_file = coordinates_file
+        self._pallet = pallet
+        self._origin = origin
+        self.last_movement: dict[str, Any] | None = None
         self._lock = threading.RLock()
+
+    # Паллета
+
+    def _settings(self) -> PalletSettings:
+        if self._pallet is None:
+            self._pallet = PalletSettings.load(self._launch_file)
+        return self._pallet
+
+    def _pallet_origin(self) -> PalletOrigin:
+        if self._origin is None:
+            self._origin = PalletOrigin.load(self._coordinates_file)
+        return self._origin
+
+    @property
+    def route(self) -> list[Cell]:
+        return build_route(self._settings(), self._pallet_origin())
+
+    def pallet_payload(self) -> dict[str, Any]:
+        try:
+            settings = self._settings()
+            origin = self._pallet_origin()
+        except PalletError as exc:
+            return {"error": str(exc)}
+        return {
+            **settings.to_dict(),
+            "origin": {
+                "x": round(origin.x, 3),
+                "y": round(origin.y, 3),
+                "z": round(origin.z, 3),
+            },
+            "start_cell": self.config.start_cell,
+            "follow_pallet": self.moves_enabled,
+        }
+
+    def reload_pallet(self) -> dict[str, Any]:
+        """Перечитать launch.json и coordinates.json (настройки могли измениться)."""
+        self._pallet = None
+        self._origin = None
+        return self.pallet_payload()
+
+    def cells(self) -> list[dict[str, Any]]:
+        """Маршрут по паллете с отметками, какие ячейки уже сняты."""
+        try:
+            route = self.route
+        except PalletError:
+            return []
+        done: dict[int, int] = {}
+        if self.store is not None:
+            for part in self.store.get_parts():
+                cell_id = part.get("cell_id")
+                if cell_id is not None:
+                    done[int(cell_id)] = int(part["part_id"])
+        current = None
+        if self.current_part_id is not None and self.store is not None:
+            part = self.store.get_part(self.current_part_id)
+            if part:
+                current = part.get("cell_id")
+        return [
+            {
+                **cell.to_dict(),
+                "part_id": done.get(cell.cell_id),
+                "collected": cell.cell_id in done,
+                "current": cell.cell_id == current,
+            }
+            for cell in route
+        ]
+
+    def _next_cell(self) -> Cell | None:
+        """Первая ячейка маршрута, начиная с ``start_cell``, ещё не снятая."""
+        used: set[int] = set()
+        if self.store is not None:
+            used = {
+                int(part["cell_id"])
+                for part in self.store.get_parts()
+                if part.get("cell_id") is not None
+            }
+        for cell in self.route:
+            if cell.cell_id < self.config.start_cell:
+                continue
+            if cell.cell_id in used:
+                continue
+            return cell
+        return None
+
+    def locate_cell(self, cell_id: int) -> Cell:
+        for cell in self.route:
+            if cell.cell_id == int(cell_id):
+                return cell
+        raise ValidationError(
+            f"Ячейки #{cell_id} нет на паллете "
+            f"({self._settings().total} ячеек)"
+        )
+
+    # Сессия
 
     @property
     def session_active(self) -> bool:
         return self.store is not None and self.store.finished_at is None
+
+    @property
+    def moves_enabled(self) -> bool:
+        """Ведёт ли мастер станцию по ячейкам паллеты в этой сессии."""
+        return self.station is not None and self.config.follow_pallet
 
     def start_session(
         self,
@@ -625,6 +795,8 @@ class TrainingCollector:
         *,
         defect_classes: Sequence[str] | None = None,
         camera_roles: Sequence[str] | None = None,
+        start_cell: int | None = None,
+        follow_pallet: bool | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             if self.store is not None and self.store.finished_at is None:
@@ -642,7 +814,21 @@ class TrainingCollector:
                 jpeg_quality=self.config.jpeg_quality,
                 validation_ratio=self.config.validation_ratio,
                 yolo_task=self.config.yolo_task,
+                start_cell=(
+                    self.config.start_cell if start_cell is None else start_cell
+                ),
+                follow_pallet=(
+                    self.config.follow_pallet
+                    if follow_pallet is None
+                    else follow_pallet
+                ),
             )
+            settings = self._settings()
+            if config.start_cell > settings.total:
+                raise ValidationError(
+                    f"Первая ячейка {config.start_cell} вне паллеты "
+                    f"({settings.total} ячеек)"
+                )
             self.config = config
             self.store = TrainingDatasetStore(config, dataset_name=dataset_name)
             self.current_part_id = None
@@ -666,44 +852,193 @@ class TrainingCollector:
                 jpeg_quality=self.config.jpeg_quality,
                 validation_ratio=self.config.validation_ratio,
                 yolo_task=self.config.yolo_task,
+                start_cell=self.config.start_cell,
+                follow_pallet=self.config.follow_pallet,
             )
             self.store.config = self.config
             self.store._write_classes()
             self.store._write_state()
             return list(classes)
 
-    def begin_part(self, label: str | None = None) -> dict[str, Any]:
+    def begin_part(
+        self,
+        label: str | None = None,
+        *,
+        cell_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Встать на ячейку паллеты и открыть по ней деталь.
+
+        Станция позиционируется до создания детали: если перемещение не
+        удалось, сессия остаётся в прежнем состоянии и оператор видит ошибку.
+        """
         with self._lock:
             self._require_session()
             if self.current_part_id is not None:
                 raise CollectorError(
                     f"Деталь #{self.current_part_id} ещё не завершена"
                 )
-            part = self.store.create_part(label)
+            if self.current_frame_id is not None:
+                raise CollectorError("Сначала сохраните разметку текущего кадра")
+            if cell_id is None:
+                cell = self._next_cell()
+                if cell is None:
+                    raise CollectorError(
+                        "Все ячейки паллеты уже сняты. Завершите набор "
+                        "или начните новую сессию с другой стартовой ячейкой."
+                    )
+            else:
+                cell = self.locate_cell(cell_id)
+                for part in self.store.get_parts():
+                    if part.get("cell_id") == cell.cell_id:
+                        raise CollectorError(
+                            f"Ячейка #{cell.cell_id} уже снята в детали "
+                            f"#{part['part_id']}"
+                        )
+            station = self.station if self.moves_enabled else None
+            movement: dict[str, Any] = {
+                "enabled": station is not None,
+                "moved": False,
+                "cell_id": cell.cell_id,
+                "target": {"x": round(cell.x, 3), "y": round(cell.y, 3), "z": round(cell.z, 3)},
+                "error": None,
+            }
+            if station is not None:
+                try:
+                    result = station.move_to_cell(cell) if hasattr(
+                        station, "move_to_cell"
+                    ) else None
+                    if result is None:
+                        raise CollectorError(
+                            "Объект станции не умеет move_to_cell(cell)"
+                        )
+                    movement.update(_movement_dict(result))
+                    movement["position_after"] = _position_dict(
+                        getattr(station, "position", None)
+                    )
+                except Exception as exc:
+                    movement["error"] = str(exc)
+                    self.last_movement = movement
+                    raise CollectorError(
+                        f"Станция не встала на ячейку #{cell.cell_id}: {exc}"
+                    ) from exc
+            self.last_movement = movement
+
+            part = self.store.create_part(
+                label or f"cell_{cell.cell_id:04d}_row{cell.row + 1}_col{cell.column + 1}",
+                cell=cell,
+                metadata=movement,
+            )
             self.current_part_id = int(part["part_id"])
             self.current_frame_id = None
-            return self.snapshot()
+            return self.snapshot(
+                extra={"part": self.store.get_part(self.current_part_id)}
+            )
 
-    def capture_next(self) -> FrameRecord:
+    def move_to_cell(self, cell_id: int) -> dict[str, Any]:
+        """Переставить станцию на ячейку, не начиная деталь.
+
+        Полезно, если паллета стоит не с первого корпуса или если оператор
+        пропустил ячейку.
+        """
+        with self._lock:
+            self._require_session()
+            if self.current_part_id is not None:
+                raise CollectorError(
+                    f"Деталь #{self.current_part_id} ещё не завершена"
+                )
+            cell = self.locate_cell(cell_id)
+            station = self.station if self.moves_enabled else None
+            movement: dict[str, Any] = {
+                "enabled": station is not None,
+                "moved": False,
+                "cell_id": cell.cell_id,
+                "target": {
+                    "x": round(cell.x, 3),
+                    "y": round(cell.y, 3),
+                    "z": round(cell.z, 3),
+                },
+                "error": None,
+            }
+            if station is not None:
+                try:
+                    movement.update(_movement_dict(station.move_to_cell(cell)))
+                    movement["position_after"] = _position_dict(
+                        getattr(station, "position", None)
+                    )
+                except Exception as exc:
+                    movement["error"] = str(exc)
+                    self.last_movement = movement
+                    raise CollectorError(
+                        f"Станция не встала на ячейку #{cell.cell_id}: {exc}"
+                    ) from exc
+            self.last_movement = movement
+            return self.snapshot(extra={"movement": movement})
+
+    def home(self) -> dict[str, Any]:
+        """Калибровка станции (``G28``) так, как это делает production."""
+        with self._lock:
+            self._require_session()
+            if self.current_part_id is not None:
+                raise CollectorError(
+                    f"Деталь #{self.current_part_id} ещё не завершена"
+                )
+            station = self.station
+            movement: dict[str, Any] = {
+                "enabled": station is not None,
+                "moved": False,
+                "error": None,
+            }
+            if station is not None:
+                try:
+                    movement.update(_movement_dict(station.home()))
+                    movement["position_after"] = _position_dict(
+                        getattr(station, "position", None)
+                    )
+                except Exception as exc:
+                    movement["error"] = str(exc)
+                    self.last_movement = movement
+                    raise CollectorError(
+                        f"Калибровка станции не выполнена: {exc}"
+                    ) from exc
+            self.last_movement = movement
+            return self.snapshot(extra={"movement": movement})
+
+    def capture_next(self, *, camera_role: str | None = None) -> FrameRecord:
+        """Снять следующую камеру текущей ячейки.
+
+        По умолчанию камеры снимаются в порядке ``camera_roles``; можно
+        переснять конкретную роль, передав ``camera_role``.
+        """
         with self._lock:
             self._require_session()
             if self.current_part_id is None:
-                raise CollectorError("Сначала начните новую деталь")
+                raise CollectorError("Сначала начните деталь")
             if self.current_frame_id is not None:
                 raise CollectorError(
                     "Сначала сохраните разметку текущего кадра"
                 )
-            frames = [
-                item
-                for item in self.store.get_frames()
-                if item.part_id == self.current_part_id
-            ]
+            frames = self.store.part_frames(self.current_part_id)
+            if camera_role:
+                role = str(camera_role).strip()
+                if role not in self.config.camera_roles:
+                    raise ValidationError(f"Неизвестная камера: {role}")
+                shot = {frame.camera_role for frame in frames}
+                if role in shot:
+                    raise CollectorError(
+                        f"Кадр камеры {role} уже снят; завершите деталь"
+                    )
+            else:
+                remaining = [
+                    role
+                    for role in self.config.camera_roles
+                    if role not in {frame.camera_role for frame in frames}
+                ]
+                if not remaining:
+                    raise CollectorError(
+                        "Все камеры этой детали уже сняты; завершите деталь"
+                    )
+                role = remaining[0]
             sequence = len(frames)
-            if sequence >= len(self.config.camera_roles):
-                raise CollectorError(
-                    "Все камеры этой детали уже сняты; завершите деталь"
-                )
-            role = self.config.camera_roles[sequence]
             if self.frame_source is None:
                 raise CollectorError("Источник камер не подключён")
             try:
@@ -750,95 +1085,38 @@ class TrainingCollector:
         return self.annotate_current(defect_class=None, boxes=())
 
     def finish_part(self) -> dict[str, Any]:
+        """Закрыть деталь.
+
+        Станция при этом не двигается: следующим шагом оператор начинает
+        новую деталь, и мастер сам переставит её на следующую ячейку.
+        """
         with self._lock:
             self._require_session()
             if self.current_part_id is None:
                 raise CollectorError("Нет открытой детали")
             if self.current_frame_id is not None:
                 raise CollectorError("Сначала сохраните разметку текущего кадра")
-            frames = [
-                item
-                for item in self.store.get_frames()
-                if item.part_id == self.current_part_id
+            frames = self.store.part_frames(self.current_part_id)
+            missing = [
+                role
+                for role in self.config.camera_roles
+                if role not in {frame.camera_role for frame in frames}
             ]
-            if len(frames) != len(self.config.camera_roles):
-                missing = self.config.camera_roles[len(frames):]
-                raise CollectorError(
-                    "Не сняты камеры: " + ", ".join(missing)
-                )
+            if missing:
+                raise CollectorError("Не сняты камеры: " + ", ".join(missing))
             part = self.store.finish_part(self.current_part_id)
             self.current_part_id = None
             self.current_frame_id = None
+        return self.snapshot(extra={"finished_part": part})
 
-        # Шаг выполняется вне блокировки: опрос ``/api/training/state`` не
-        # должен ждать, пока лента физически пройдёт расстояние до
-        # следующего корпуса.
-        movement = self._advance_conveyor()
-        with self._lock:
-            return self.snapshot(
-                extra={
-                    "finished_part": part,
-                    "conveyor": movement,
-                }
-            )
-
-    def _advance_conveyor(self) -> dict[str, Any]:
-        """Сделать один шаг ленты к следующей детали.
-
-        Разметка к этому моменту уже сохранена на диске, поэтому сбой
-        оборудования не отменяет завершение детали: оператор получает
-        результат шага в поле ``conveyor`` и может повторить его кнопкой
-        «Сдвинуть ленту», не теряя открытую сессию.
-        """
-        if self.conveyor is None:
-            result: dict[str, Any] = {
-                "enabled": False,
-                "moved": False,
-                "error": None,
-            }
-        else:
-            try:
-                result = {
-                    "enabled": True,
-                    **dict(self.conveyor.advance() or {}),
-                }
-                result.setdefault("moved", False)
-            except Exception as exc:
-                result = {
-                    "enabled": True,
-                    "moved": False,
-                    "error": str(exc),
-                }
-        self.last_conveyor_result = result
-        return result
-
-    def step_conveyor(self) -> dict[str, Any]:
-        """Повторить шаг ленты вручную после сбоя оборудования.
-
-        Двигать ленту посреди детали нельзя: кадры и разметка относятся к
-        текущему положению корпуса. Поэтому шаг разрешён только между
-        деталями.
-        """
-        with self._lock:
-            self._require_session()
-            if self.current_frame_id is not None:
-                raise CollectorError("Сначала сохраните разметку текущего кадра")
-            if self.current_part_id is not None:
-                raise CollectorError(
-                    f"Деталь #{self.current_part_id} ещё не завершена"
-                )
-        movement = self._advance_conveyor()
-        with self._lock:
-            return self.snapshot(extra={"conveyor": movement})
-
-    def finish_session(self) -> dict[str, Any]:
+    def finish_session(self, *, go_home: bool = False) -> dict[str, Any]:
         with self._lock:
             self._require_session()
             if self.current_frame_id is not None:
                 raise CollectorError("Сначала сохраните разметку текущего кадра")
             if self.current_part_id is not None:
                 raise CollectorError("Сначала завершите текущую деталь")
-            from training.yolo import export_yolo_dataset
+            from project.training.yolo import export_yolo_dataset
 
             # Сначала строим экспорт: если на диске не хватает файла, оператор
             # получает ошибку и может исправить её, не теряя открытую сессию.
@@ -848,7 +1126,13 @@ class TrainingCollector:
             ).to_dict()
             result = self.store.mark_finished()
             result["yolo"] = yolo
-            return result
+            station = self.station
+        if go_home and station is not None:
+            try:
+                result["home"] = _movement_dict(station.home())
+            except Exception as exc:
+                result["home"] = {"moved": False, "error": str(exc)}
+        return result
 
     def get_current_record(self) -> FrameRecord | None:
         with self._lock:
@@ -858,6 +1142,15 @@ class TrainingCollector:
 
     def snapshot(self, *, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._lock:
+            pallet = self.pallet_payload()
+            station_status = (
+                {
+                    **self.station.status(),
+                    "following": self.moves_enabled,
+                }
+                if self.station is not None and hasattr(self.station, "status")
+                else {"enabled": False, "connected": False, "following": False}
+            )
             if self.store is None:
                 result = {
                     "active": False,
@@ -865,30 +1158,38 @@ class TrainingCollector:
                     "part": None,
                     "current_frame": None,
                     "next_role": None,
+                    "next_cell": None,
                     "camera_roles": list(self.config.camera_roles),
                     "defect_classes": list(self.config.defect_classes),
+                    "pallet": pallet,
+                    "station": station_status,
+                    "cells": [],
+                    "movement": self.last_movement,
                 }
             else:
-                frames = self.store.get_frames()
-                part_frames = [
-                    item
-                    for item in frames
-                    if item.part_id == self.current_part_id
-                ] if self.current_part_id is not None else []
-                next_role = (
-                    self.config.camera_roles[len(part_frames)]
+                part = (
+                    self.store.get_part(self.current_part_id)
                     if self.current_part_id is not None
-                    and len(part_frames) < len(self.config.camera_roles)
                     else None
                 )
-                part = next(
+                part_frames = (
+                    self.store.part_frames(self.current_part_id)
+                    if self.current_part_id is not None
+                    else []
+                )
+                shot_roles = {frame.camera_role for frame in part_frames}
+                next_role = next(
                     (
-                        item
-                        for item in self.store.get_parts()
-                        if item["part_id"] == self.current_part_id
+                        role
+                        for role in self.config.camera_roles
+                        if role not in shot_roles
                     ),
                     None,
                 )
+                try:
+                    next_cell = self._next_cell()
+                except PalletError:
+                    next_cell = None
                 result = {
                     "active": self.session_active,
                     "session": self.store.state_payload(),
@@ -899,8 +1200,13 @@ class TrainingCollector:
                         else None
                     ),
                     "next_role": next_role,
+                    "next_cell": next_cell.to_dict() if next_cell else None,
                     "camera_roles": list(self.config.camera_roles),
                     "defect_classes": list(self.config.defect_classes),
+                    "pallet": pallet,
+                    "station": station_status,
+                    "cells": self.cells(),
+                    "movement": self.last_movement,
                 }
             if extra:
                 result.update(extra)
@@ -939,10 +1245,7 @@ class TrainingCollector:
                 raise ValidationError(
                     "Для выбранного элемента нужно обвести хотя бы одну область"
                 )
-            parsed = [
-                _with_class_name(selected, item)
-                for item in parsed
-            ]
+            parsed = [_with_class_name(selected, item) for item in parsed]
 
         for item in parsed:
             if not item.class_name:
@@ -973,6 +1276,26 @@ def _with_class_name(class_name: str, annotation: Any) -> Any:
         annotation.width,
         annotation.height,
     )
+
+
+def _movement_dict(result: Any) -> dict[str, Any]:
+    if result is None:
+        return {"moved": False}
+    if hasattr(result, "to_dict"):
+        return dict(result.to_dict())
+    if isinstance(result, dict):
+        return dict(result)
+    return {"moved": bool(result)}
+
+
+def _position_dict(position: Any) -> dict[str, float] | None:
+    if position is None:
+        return None
+    try:
+        x, y, z = position
+    except (TypeError, ValueError):
+        return None
+    return {"x": round(float(x), 3), "y": round(float(y), 3), "z": round(float(z), 3)}
 
 
 def _normalise_roles(values: Sequence[str] | None) -> tuple[str, ...]:
@@ -1039,7 +1362,21 @@ def _copy_record(record: FrameRecord | None) -> FrameRecord | None:
         annotations=list(record.annotations),
         captured_at=record.captured_at,
         annotated_at=record.annotated_at,
+        cell_id=record.cell_id,
+        row=record.row,
+        column=record.column,
     )
+
+
+def _copy_part(part: dict[str, Any] | None) -> dict[str, Any] | None:
+    if part is None:
+        return None
+    copy = dict(part)
+    copy["frame_ids"] = list(part.get("frame_ids") or [])
+    copy["movement"] = dict(part.get("movement") or {})
+    if part.get("coordinates"):
+        copy["coordinates"] = dict(part["coordinates"])
+    return copy
 
 
 def _relative_path(path: Path, root: Path) -> str:

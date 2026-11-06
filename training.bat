@@ -10,7 +10,9 @@ pause
 exit /b 1
 
 :run
-".venv\Scripts\python.exe" -m training --open-browser %*
+rem Мастер запускается из корня проекта: production-функции читают
+rem project/configuration/*.json по относительным путям.
+".venv\Scripts\python.exe" -m project.training --open-browser %*
 set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" pause
 endlocal & exit /b %EXIT_CODE%

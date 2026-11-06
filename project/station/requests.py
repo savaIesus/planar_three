@@ -44,7 +44,7 @@ def move_to_coordinates(serial_connection, x=None, y=None, z=None):
     max_speed_z = 5
     max_speed_xy = 25
 
-    if not serial_connection.is_open:
+    if serial_connection is None or not serial_connection.is_open:
         raise ConnectionError("Ошибка: Соединение с устройством отсутствует.")
     prev_x = read_from_json(
         "project/configuration/coordinates.json",
@@ -102,7 +102,7 @@ def move_to_home(serial_connection):
     param serial_connection: Объект подключения (serial.Serial).
     """
     try:
-        if not serial_connection.is_open:
+        if serial_connection is None or not serial_connection.is_open:
             raise ConnectionError("Ошибка: Соединение с устройством отсутствует.")
 
         send_command(serial_connection, 'G28')
