@@ -6,11 +6,13 @@
         connection: $('connection-state'), setup: $('setup-panel'), work: $('work-panel'),
         result: $('result-panel'), datasetName: $('dataset-name'), classes: $('defect-classes'),
         roles: $('camera-roles'), create: $('create-session'), setupMessage: $('setup-message'),
+        startCell: $('start-cell'), palletInfo: $('pallet-info'), stationState: $('station-state'),
         sessionTitle: $('session-title'), sessionStatus: $('session-status'), partsCount: $('parts-count'),
         framesCount: $('frames-count'), partNumber: $('part-number'), partProgress: $('part-progress'),
-        newPart: $('new-part'), finishPart: $('finish-part'), stepConveyor: $('step-conveyor'),
-        export: $('export-dataset'),
+        cellChip: $('cell-chip'), newPart: $('new-part'), finishPart: $('finish-part'),
+        stationHome: $('station-home'), export: $('export-dataset'),
         finishSession: $('finish-session'), workflowMessage: $('workflow-message'), cameraTitle: $('camera-title'),
+        cellGrid: $('cell-grid'), palletProgress: $('pallet-progress'),
         frameId: $('frame-id'), wrap: $('canvas-wrap'), emptyState: $('empty-state'), image: $('frame-image'),
         canvas: $('annotation-canvas'), frameRole: $('frame-role'), frameSize: $('frame-size'),
         annotationHelp: $('annotation-help'), palette: $('element-palette'),
@@ -30,6 +32,7 @@
     let hoverPoint = null;
     let noDefectSelected = false;
     let lastError = '';
+    let busy = false;
 
     function setMessage(element, text, kind = '') {
         if (!element) return;
@@ -54,16 +57,73 @@
             .map((item) => item.value);
     }
 
+    function escapeHtml(value) {
+        return String(value).replace(/[&<>'"]/g, (char) => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+        }[char]));
+    }
+
+    // Названия ролей как в production-проекте (project/alghorithms/contour.py):
+    // near — камера 0, far — камера 1, middle — камера 2. Индексы можно
+    // переопределить ключом --indices, поэтому подпись берётся из конфигурации.
+    const ROLE_TITLES = {
+        near: 'Ближняя',
+        far: 'Дальняя',
+        middle: 'Верхняя',
+    };
+    let cameraMapping = {};
+
+    function roleTitle(role) {
+        const title = ROLE_TITLES[role] || role;
+        const index = cameraMapping[role];
+        return Number.isInteger(index) ? `${title} (камера ${index})` : title;
+    }
+
     function fillSetup(data) {
         config = data;
+        cameraMapping = data.camera_mapping || {};
         els.classes.value = data.defect_classes.join(', ');
         els.roles.replaceChildren();
         data.camera_roles.forEach((role) => {
             const label = document.createElement('label');
             label.className = 'check-item';
-            label.innerHTML = `<input type="checkbox" value="${escapeHtml(role)}" checked><span>${escapeHtml(role)}</span>`;
+            label.innerHTML = `<input type="checkbox" value="${escapeHtml(role)}" checked>` +
+                `<span>${escapeHtml(roleTitle(role))}</span>`;
             els.roles.appendChild(label);
         });
+        els.startCell.value = String(data.start_cell || 1);
+        renderPalletInfo(data.pallet);
+        renderStation(data.stations || data.station || {});
+    }
+
+    function renderPalletInfo(pallet) {
+        if (!pallet || pallet.error) {
+            els.palletInfo.textContent = pallet && pallet.error ? pallet.error : '—';
+            els.palletInfo.classList.add('error');
+            return;
+        }
+        els.palletInfo.classList.remove('error');
+        els.palletInfo.textContent = `${pallet.rows} × ${pallet.columns} = ${pallet.total} корпусов · ` +
+            `шаг ${pallet.step_x} × ${pallet.step_y} мм`;
+        if (pallet.start_cell && !els.startCell.dataset.touched) {
+            els.startCell.value = String(pallet.start_cell);
+        }
+    }
+
+    function renderStation(station) {
+        if (!station) { els.stationState.textContent = '—'; return; }
+        if (station.enabled === false) {
+            els.stationState.textContent = 'Движение отключено (--motion off): кадры снимаются с текущей позиции';
+            els.stationState.className = 'field-static';
+            return;
+        }
+        const position = station.position;
+        const pos = position
+            ? `X=${position.x} Y=${position.y} Z=${position.z}`
+            : 'позиция неизвестна';
+        els.stationState.textContent = `${station.connected ? 'Подключена' : 'Не подключена'} · ${pos}` +
+            (station.port ? ` · ${station.port}` : '');
+        els.stationState.className = `field-static ${station.connected ? 'ok' : 'muted'}`;
     }
 
     function fillClasses(names) {
@@ -100,7 +160,7 @@
     }
 
     function annotationEditable() {
-        return Boolean(currentFrame) && !els.save.disabled;
+        return Boolean(currentFrame) && !els.save.disabled && !busy;
     }
 
     function selectElement(name) {
@@ -118,18 +178,33 @@
     function updatePaletteSelection() {
         if (!els.palette) return;
         [...els.palette.querySelectorAll('.palette-item')].forEach((button) => {
-            button.classList.toggle(
-                'active',
-                button.dataset.element === els.classSelect.value,
-            );
+            button.classList.toggle('selected', button.dataset.element === els.classSelect.value);
             button.disabled = !annotationEditable();
         });
     }
 
-    function escapeHtml(value) {
-        return String(value).replace(/[&<>'"]/g, (char) => ({
-            '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
-        }[char]));
+    function renderPallet(cells, pallet) {
+        if (!els.cellGrid) return;
+        els.cellGrid.style.setProperty('--cols', String((pallet && pallet.columns) || 10));
+        els.cellGrid.replaceChildren();
+        const list = cells || [];
+        list.forEach((cell) => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'cell-button';
+            button.textContent = String(cell.cell_id);
+            if (cell.cell_id % 2 === 0) button.classList.add('alt-row');
+            if (cell.collected) button.classList.add('collected');
+            if (cell.current) button.classList.add('current');
+            button.title = `Ячейка ${cell.cell_id} · ряд ${cell.row + 1}, колонка ${cell.column + 1}\n` +
+                `X=${cell.x} Y=${cell.y} Z=${cell.z}` +
+                (cell.part_id ? `\nкорпус #${cell.part_id}` : '');
+            button.disabled = busy || !(state && state.active);
+            button.addEventListener('click', () => moveToCell(cell.cell_id));
+            els.cellGrid.appendChild(button);
+        });
+        const done = list.filter((cell) => cell.collected).length;
+        els.palletProgress.textContent = `${done} / ${list.length}`;
     }
 
     function renderState(next) {
@@ -145,30 +220,48 @@
         els.sessionStatus.textContent = state.active ? (part ? 'СБОРКА' : 'ГОТОВА') : 'ЗАВЕРШЕНА';
         els.partNumber.textContent = part ? `#${part.part_id}` : '—';
         if (part) {
-            els.partProgress.textContent = `${frameIds.length} из ${expected} камер снято · ${state.next_role ? `следующая: ${state.next_role}` : 'все камеры готовы'}`;
+            const cell = part.cell_id ? `ячейка ${part.cell_id}` : 'ячейка без координат';
+            els.partProgress.textContent = `${cell} · ${frameIds.length} из ${expected} камер снято · ` +
+                (state.next_role ? `следующая: ${roleTitle(state.next_role)}` : 'все камеры готовы');
+            els.cellChip.classList.remove('hidden');
+            const coordinates = part.coordinates
+                ? `X=${part.coordinates.x} Y=${part.coordinates.y} Z=${part.coordinates.z}`
+                : 'координаты не заданы';
+            els.cellChip.textContent = `ряд ${(part.row ?? 0) + 1}, колонка ${(part.column ?? 0) + 1} · ${coordinates}`;
         } else {
-            els.partProgress.textContent = state.active ? 'Начните новую деталь' : 'Сессия завершена';
+            els.cellChip.classList.add('hidden');
+            if (state.next_cell) {
+                els.partProgress.textContent = state.active
+                    ? `Следующий корпус — ячейка ${state.next_cell.cell_id} ` +
+                      `(ряд ${state.next_cell.row + 1}, колонка ${state.next_cell.column + 1})`
+                    : 'Сессия завершена';
+            } else {
+                els.partProgress.textContent = state.active
+                    ? 'Все ячейки паллеты сняты — завершите набор'
+                    : 'Сессия завершена';
+            }
         }
-        const busy = Boolean(currentFrame) || Boolean(state.current_frame);
-        els.newPart.disabled = !state.active || Boolean(part) || busy;
-        els.finishPart.disabled = !state.active || !part || busy || frameIds.length !== expected;
-        const conveyorEnabled = !config || config.conveyor_step !== false;
-        els.stepConveyor.classList.toggle('hidden', !conveyorEnabled);
-        els.stepConveyor.disabled = !state.active || Boolean(part) || busy;
-        els.finishSession.disabled = !state.active || Boolean(part) || busy || Number(session.frame_count || 0) === 0;
-        els.export.disabled = !state.active || Number(session.frame_count || 0) === 0;
-        els.nextCamera.disabled = true;
-        if (state.next_role && !currentFrame && part) {
-            els.cameraTitle.textContent = `Готова камера ${state.next_role}`;
-        }
+        const frameBusy = Boolean(currentFrame) || Boolean(state.current_frame);
+        els.newPart.disabled = busy || !state.active || Boolean(part) || frameBusy || !state.next_cell;
+        els.finishPart.disabled = busy || !state.active || !part || frameBusy || frameIds.length !== expected;
+        els.stationHome.disabled = busy || !state.active || Boolean(part) || frameBusy;
+        els.finishSession.disabled = busy || !state.active || Boolean(part) || frameBusy ||
+            Number(session.frame_count || 0) === 0;
+        els.export.disabled = busy || !state.active || Number(session.frame_count || 0) === 0;
+        renderPallet(state.cells || [], state.pallet || {});
+        renderStation(state.station);
+        if (state.pallet && !state.pallet.error) renderPalletInfo(state.pallet);
         if (!currentFrame) {
             els.save.disabled = true;
             els.finishPolygon.disabled = true;
             els.noDefect.disabled = true;
             els.clearBox.disabled = true;
             els.classSelect.disabled = true;
-            els.newElement.disabled = !state.active;
-            els.addElement.disabled = !state.active;
+            els.newElement.disabled = busy || !state.active;
+            els.addElement.disabled = busy || !state.active;
+            if (state.next_role && part) {
+                els.cameraTitle.textContent = `Готова камера ${roleTitle(state.next_role)}`;
+            }
         }
         updatePaletteSelection();
     }
@@ -189,7 +282,7 @@
         els.frameId.textContent = 'FRAME —';
         els.frameRole.textContent = 'КАМЕРА —';
         els.frameSize.textContent = '— × —';
-        els.cameraTitle.textContent = 'Ожидание детали';
+        els.cameraTitle.textContent = 'Ожидание корпуса';
         els.annotationHelp.textContent = 'Кликайте точки контура, затем нажмите «Завершить область»';
         els.classSelect.value = '';
         els.classSelect.disabled = true;
@@ -224,9 +317,10 @@
         const url = (annotated && frame.annotated_url) ? frame.annotated_url : frame.original_url;
         els.image.src = `${url}${url.includes('?') ? '&' : '?'}v=${Date.now()}`;
         els.frameId.textContent = `FRAME #${frame.image_id}`;
-        els.frameRole.textContent = frame.camera_role || frame.role || 'КАМЕРА —';
+        els.frameRole.textContent = roleTitle(frame.camera_role || frame.role || '—');
         els.frameSize.textContent = `${frame.width} × ${frame.height}`;
-        els.cameraTitle.textContent = `${frame.camera_role || frame.role} · разметка`;
+        const cell = frame.cell_id ? `ячейка ${frame.cell_id} · ` : '';
+        els.cameraTitle.textContent = `${cell}${frame.camera_role || frame.role} · разметка`;
         els.annotationHelp.textContent = annotated
             ? 'Разметка сохранена. Можно переходить к следующей камере.'
             : 'Кликайте точки контура, затем нажмите «Завершить область»';
@@ -417,23 +511,42 @@
         if (event.key === 'Enter') els.addElement.click();
     });
 
+    els.startCell.addEventListener('input', () => { els.startCell.dataset.touched = '1'; });
+
     async function loadCapture() {
         clearMessages();
+        setBusy(true, 'Снимаем кадр…');
         try {
             const result = await api('/api/training/capture', {method: 'POST', body: '{}'});
             renderState(result.state);
             showFrame(result.frame, false);
-            setMessage(els.annotationMessage, `Кадр #${result.frame.image_id} сохранён. Выберите элемент и поставьте точки контура.`, 'ok');
+            setMessage(els.annotationMessage,
+                `Кадр #${result.frame.image_id} сохранён. Выберите элемент и поставьте точки контура.`, 'ok');
         } catch (error) {
             setMessage(els.annotationMessage, error.message, 'error');
+            renderState(state);
+        } finally {
+            setBusy(false);
         }
+    }
+
+    function setBusy(value, message = '') {
+        busy = Boolean(value);
+        if (message) setMessage(els.workflowMessage, message);
+        document.body.classList.toggle('busy', busy);
+        renderState(state);
     }
 
     els.create.addEventListener('click', async () => {
         const roles = selectedValues(els.roles);
         const classes = els.classes.value.split(',').map((item) => item.trim()).filter(Boolean);
+        const startCell = Number(els.startCell.value || 1);
         if (!roles.length) { setMessage(els.setupMessage, 'Выберите хотя бы одну камеру.', 'error'); return; }
         if (!classes.length) { setMessage(els.setupMessage, 'Укажите хотя бы один элемент палитры.', 'error'); return; }
+        if (!Number.isInteger(startCell) || startCell < 1) {
+            setMessage(els.setupMessage, 'Номер первого корпуса должен быть целым числом ≥ 1.', 'error');
+            return;
+        }
         els.create.disabled = true;
         try {
             const result = await api('/api/training/session', {
@@ -442,13 +555,15 @@
                     dataset_name: els.datasetName.value.trim() || 'defects',
                     camera_roles: roles,
                     defect_classes: classes,
+                    start_cell: startCell,
                 }),
             });
             fillClasses(result.defect_classes || classes);
             renderState(result);
             els.setup.classList.add('hidden');
             els.work.classList.remove('hidden');
-            setMessage(els.workflowMessage, 'Набор создан. Нажмите «Новая деталь», затем мастер покажет первую камеру.', 'ok');
+            setMessage(els.workflowMessage,
+                'Набор создан. Нажмите «Снять следующий корпус» — станция встанет на его ячейку.', 'ok');
         } catch (error) {
             setMessage(els.setupMessage, error.message, 'error');
             els.create.disabled = false;
@@ -456,17 +571,58 @@
     });
 
     els.newPart.addEventListener('click', async () => {
-        els.newPart.disabled = true;
+        setBusy(true, 'Станция едет на координаты ячейки…');
         try {
             const result = await api('/api/training/parts', {method: 'POST', body: '{}'});
             renderState(result);
-            setMessage(els.workflowMessage, `Деталь #${result.part.part_id} начата. Снимаем ${result.next_role}.`);
+            const part = result.part || {};
+            const placement = part.cell_id
+                ? `Ячейка ${part.cell_id} (ряд ${(part.row ?? 0) + 1}, колонка ${(part.column ?? 0) + 1}).`
+                : 'Координаты не заданы.';
+            setMessage(els.workflowMessage,
+                `${placement} Корпус #${part.part_id} начат, снимаем ${roleTitle(result.next_role)}.`, 'ok');
             await loadCapture();
         } catch (error) {
             setMessage(els.workflowMessage, error.message, 'error');
-            renderState(state);
+            setBusy(false);
         }
     });
+
+    els.stationHome.addEventListener('click', async () => {
+        setBusy(true, 'Калибровка станции (G28)…');
+        try {
+            const result = await api('/api/training/home', {method: 'POST', body: '{}'});
+            renderState(result);
+            setMessage(els.workflowMessage, 'Станция откалибрована и припаркована.', 'ok');
+        } catch (error) {
+            setMessage(els.workflowMessage, error.message, 'error');
+        } finally {
+            setBusy(false);
+        }
+    });
+
+    async function moveToCell(cellId) {
+        if (busy) return;
+        setBusy(true, `Станция едет в ячейку ${cellId}…`);
+        try {
+            const result = await api('/api/training/cells/move', {
+                method: 'POST', body: JSON.stringify({cell_id: cellId}),
+            });
+            renderState(result);
+            const movement = (result && result.movement) || {};
+            const target = movement.target
+                ? `X=${movement.target.x} Y=${movement.target.y} Z=${movement.target.z}`
+                : '';
+            setMessage(els.workflowMessage, movement.moved
+                ? `Станция встала на ячейку ${cellId} (${target}). Можно начинать съёмку.`
+                : `Станция отключена; ячейка ${cellId} выбрана для съёмки с текущей позиции.`,
+                'ok');
+        } catch (error) {
+            setMessage(els.workflowMessage, error.message, 'error');
+        } finally {
+            setBusy(false);
+        }
+    }
 
     els.save.addEventListener('click', async () => {
         if (!currentFrame) return;
@@ -475,7 +631,8 @@
             return;
         }
         if (!noDefectSelected && !annotations.length) {
-            setMessage(els.annotationMessage, 'Выберите элемент и обведите область. Если дефекта нет — нажмите «Дефекта нет».', 'error');
+            setMessage(els.annotationMessage,
+                'Выберите элемент и обведите область. Если дефекта нет — нажмите «Дефекта нет».', 'error');
             return;
         }
         els.save.disabled = true;
@@ -494,8 +651,8 @@
                 ? 'Кадр сохранён как отрицательный пример.'
                 : 'Готово: оригинал и изображение с polygon-областями записаны.', 'ok');
             setMessage(els.workflowMessage, result.state.next_role
-                ? `Готово. Следующая камера: ${result.state.next_role}.`
-                : 'Все камеры детали готовы. Завершите деталь.', 'ok');
+                ? `Готово. Следующая камера: ${roleTitle(result.state.next_role)}.`
+                : 'Все три камеры корпуса сняты. Завершите корпус.', 'ok');
         } catch (error) {
             els.save.disabled = false;
             setMessage(els.annotationMessage, error.message, 'error');
@@ -509,76 +666,51 @@
     });
 
     els.finishPart.addEventListener('click', async () => {
-        els.finishPart.disabled = true;
-        setMessage(els.workflowMessage, 'Деталь сохранена. Перемещаем ленту к следующему корпусу…');
+        setBusy(true, 'Сохраняем корпус…');
         try {
             const result = await api('/api/training/parts/finish', {method: 'POST', body: '{}'});
             resetFrame();
             renderState(result);
-            const conveyor = result.conveyor || {};
             const partId = result.finished_part ? result.finished_part.part_id : '—';
-            const step = Number.isInteger(conveyor.step) ? ` (STEP=${conveyor.step})` : '';
-            if (conveyor.moved) {
-                setMessage(
-                    els.workflowMessage,
-                    `Деталь #${partId} сохранена. Конвейер сделал шаг к следующему корпусу${step}. Можно начинать следующую деталь.`,
-                    'ok',
-                );
-            } else if (conveyor.enabled === false) {
-                setMessage(els.workflowMessage, `Деталь #${partId} сохранена. Шаг конвейера отключён.`, 'ok');
-            } else {
-                setMessage(
-                    els.workflowMessage,
-                    `Деталь #${partId} сохранена, но лента не сдвинулась: ${conveyor.error || 'неизвестная ошибка'}. Проверьте контроллер и нажмите «СДВИНУТЬ ЛЕНТУ».`,
-                    'error',
-                );
-            }
+            const nextCell = result.next_cell
+                ? ` Следующая ячейка — ${result.next_cell.cell_id}.`
+                : ' Все ячейки паллеты сняты.';
+            setMessage(els.workflowMessage,
+                `Корпус #${partId} сохранён.${nextCell} Нажмите «Снять следующий корпус».`, 'ok');
         } catch (error) {
             setMessage(els.workflowMessage, error.message, 'error');
-            renderState(state);
-        }
-    });
-
-    els.stepConveyor.addEventListener('click', async () => {
-        els.stepConveyor.disabled = true;
-        setMessage(els.workflowMessage, 'Перемещаем ленту к следующему корпусу…');
-        try {
-            const result = await api('/api/training/conveyor/step', {method: 'POST', body: '{}'});
-            renderState(result);
-            const conveyor = result.conveyor || {};
-            const step = Number.isInteger(conveyor.step) ? ` (STEP=${conveyor.step})` : '';
-            if (conveyor.moved) {
-                setMessage(els.workflowMessage, `Лента перемещена к следующему корпусу${step}.`, 'ok');
-            } else {
-                setMessage(
-                    els.workflowMessage,
-                    `Лента не сдвинулась: ${conveyor.error || 'неизвестная ошибка'}`,
-                    'error',
-                );
-            }
-        } catch (error) {
-            setMessage(els.workflowMessage, error.message, 'error');
-            renderState(state);
+        } finally {
+            setBusy(false);
         }
     });
 
     els.export.addEventListener('click', async () => {
         try {
             const result = await api('/api/training/export', {method: 'POST', body: '{}'});
-            setMessage(els.workflowMessage, `YOLO-${result.yolo.task || 'segment'}-экспорт обновлён: train ${result.yolo.train_count}, val ${result.yolo.validation_count}.`, 'ok');
+            setMessage(els.workflowMessage,
+                `YOLO-${result.yolo.task || 'segment'}-экспорт обновлён: train ${result.yolo.train_count}, ` +
+                `val ${result.yolo.validation_count}.`, 'ok');
         } catch (error) { setMessage(els.workflowMessage, error.message, 'error'); }
     });
 
     els.finishSession.addEventListener('click', async () => {
-        if (!confirm('Завершить набор и подготовить структуру YOLO segmentation?')) return;
+        if (!confirm('Завершить набор и подготовить структуру YOLO?')) return;
+        setBusy(true);
         try {
-            const result = await api('/api/training/session/finish', {method: 'POST', body: '{}'});
+            const result = await api('/api/training/session/finish', {
+                method: 'POST', body: JSON.stringify({go_home: true}),
+            });
             els.work.classList.add('hidden');
             els.result.classList.remove('hidden');
             const yolo = result.yolo || {};
-            els.resultText.textContent = `Полигоны экспортированы: train (${yolo.train_count || 0}), val (${yolo.validation_count || 0}). Пустые label-файлы сохранены для кадров без дефекта.`;
+            els.resultText.textContent = `Полигоны экспортированы: train (${yolo.train_count || 0}), ` +
+                `val (${yolo.validation_count || 0}). Пустые label-файлы сохранены для кадров без дефекта.`;
             els.resultYaml.textContent = yolo.yaml_path || 'dataset.yaml создан в папке партии';
-        } catch (error) { setMessage(els.workflowMessage, error.message, 'error'); }
+        } catch (error) {
+            setMessage(els.workflowMessage, error.message, 'error');
+        } finally {
+            setBusy(false);
+        }
     });
 
     function clearMessages() {
@@ -600,10 +732,18 @@
                 els.work.classList.remove('hidden');
                 if (existing.current_frame) {
                     showFrame(existing.current_frame, false);
-                    setMessage(els.annotationMessage, 'Сессия восстановлена. Продолжите обводку точками.', 'ok');
+                    setMessage(els.annotationMessage,
+                        'Сессия восстановлена. Продолжите обводку точками.', 'ok');
                 } else {
-                    setMessage(els.workflowMessage, 'Сессия восстановлена. Можно продолжить текущую деталь или начать новую.', 'ok');
+                    setMessage(els.workflowMessage,
+                        'Сессия восстановлена. Можно продолжить текущий корпус или начать следующий.', 'ok');
                 }
+            }
+            if (existing) {
+                // server запущен, но сессия ещё не создана: показываем
+                // маршрут по паллете прямо в форме настройки.
+                fillClasses(data.defect_classes || []);
+                renderState(existing);
             }
         } catch (error) {
             els.connection.textContent = 'ОШИБКА СОЕДИНЕНИЯ';

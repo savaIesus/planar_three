@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# датасеты мастера сбора кадров
+training_datasets/
